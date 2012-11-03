@@ -1,0 +1,2 @@
+Spoiler-Blocker
+===============
