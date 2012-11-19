@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Spoiler Blocker</title>
+    <link rel="stylesheet" href="style.css" />
+
+    <!-- JavaScript and HTML must be in separate files for security. -->
+    <script src="jquery-1.8.2.min.js"></script>
+    <script src="underscore-min.js"></script>
+    <script src="templates.js"></script>
+    <script src="popup.js"></script>
+    
+  </head>
+
+
+  <body>
+    <h2>Spoiler Blocker</h2>
+
+    <form method="POST" action="http://127.0.0.1:5000/vote">
+      <select id="events-dropdown" name="event" required>
+        <option value="" disabled>Select an event to vote for</option>
+      </select>
+      <label for="vote">Should this web page be blocked for the event you chose?</label>
+      <input id="vote" name="vote" type="checkbox">
+      <input id="content" name="content" type="hidden">
+      <input id="url" name="url" type="hidden">
+      <input type="submit" value="Submit vote for this page">
+    </form>
+  </body>
+</html>
