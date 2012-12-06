@@ -1,87 +1,127 @@
+var pageContent, pageUrl, games, blockedGames, 
+    gamesListView, blockedGamesView, 
+    messagesList, messagesListView;
+
 $(function () {
-  console.log("this is working");
+  // Collections
+  games = new AllGames();
+  blockedGames = new BlockedGames();
+  messagesList = new MessagesList();
+  // Views
+  // Note: right now I'm passing in blockedGames to gamesListView - should set up a 
+  // central event dispatcher so I don't have that dependency
+  messagesListView = new MessagesListView({ collection: messagesList });
+  gamesListView = new GamesListView({ 
+    collection: games, 
+    blockedGames: blockedGames
+  });
+  blockedGamesView = new BlockedGamesView({ collection: blockedGames });
 
+  games.fetch({success: function () {
+    console.log("Successfully fetched games from server:", games);
+    gamesListView.render();
+    
+  }});
 
-  // events = [] //populate this with AJAX call with Event objects
-  // for (var i = 0, evnt; evnt = events[i], i++) {
+  for (var i = 1; i < 18; i++) {
+    var opt = $("<option>").attr("val", i).text(i);
+    $("#pick-week").append(opt);
+  }
+  $("#pick-week").change( function (e) {
+    // clear the list
+    $("#games-list").html();
 
-  // }
-  // $("#events-dropdown").append()
+    $.each(games.models, function (idx, game) {
+      if (game.week == $("#pick-week").val()) {
+        var elem = $("<li>").text(game).prepend("<input type=checkbox>");
+        $("#game-list").append(elem);
+      }
+    });
+  });
+  
 
-  $.getJSON('http://127.0.0.1:5000/events/', function (data) {
-  	console.log(data);
-  	var elem = $("select#events-dropdown");
-  	for (var i = 0, eventJSON; eventJSON = data[i]; i++) {
-  		console.log("event:", eventJSON);
-  		var evt = Event.prototype.fromJSON(eventJSON);
+  $("form#vote-form").submit( function (e) {
+    e.preventDefault();
 
-  		var newElem = $("<option>").attr("value", evt.id).text(evt);
-			elem.append(newElem);
-  	}
+    if (!pageUrl || !pageContent) {
+      // Page may have been refreshed while popup was open,
+      // so need to get page info again.
+      // Then Post vote to server
+      console.log("Retrieving page info before posting vote.");
+      getPageInfo(postVote);
+    } else {
+      // Otherwise just post the vote
+      postVote();
+    }
+
+    
   });
 
+  // Once popup is opened, execute content script to
+  // get html of the web page currently being viewed
+  getPageInfo();
+});
+
+var getPageInfo = function (callback) {
   chrome.tabs.executeScript(null, { file: "jquery-1.8.2.min.js" }, function() {
     chrome.tabs.executeScript(null, { file: "contentscript.js" });
     chrome.extension.onRequest.addListener( function (data, sender, sendResponse) {
-    	console.log("ok got message back from content script! in popup");
-    	// console.log("data:", $(data));
-    	// $(data).not("script").each( function (idx, elem) {
-    	// 	console.log(idx, elem, $(elem).text());
-    	// });
-    	// console.log("text:", text);
-    	$("input#content").val(data.content)
-    	$("input#url").val(data.url)
+        console.log("ok got message back from content script! in popup:", data);
+        // console.log("data:", $(data));
+        // $(data).not("script").each( function (idx, elem) {
+        //  console.log(idx, elem, $(elem).text());
+        // });
+        // console.log("text:", text);
+        if (!data.url || !data.content) alert("Something went wrong getting page info from content script.");
+
+        pageUrl = data.url;
+        pageContent = data.content;
+        // $("input#content").val(data.content)
+        // $("input#url").val(data.url)
+
+        if (callback) callback();
     });
   }); 
-});
-
-var Event = function (id, start, team1, team2, loc, score) {
-	if (!this instanceof Event) return new Event(id, start, team1, team2, loc, score);
-
-	this.id = id;
-	this.start = start;
-	this.team1 = team1;
-	this.team2 = team2;
-	this.loc = loc;
-	this.score = score;
-
-	this.toString = function () {
-		return this.team1 + " vs " + this.team2;
-	}
 }
 
-Event.prototype.fromJSON = function (jsono) {
-	if (jsono.id && jsono.start && 
-			jsono.team1 && jsono.team2 && 
-			jsono.loc) {
+var postVote = function () {
+  var url = "http://127.0.0.1:5000/vote";
 
-		var t1 = jsono.team1;
-		t1 = new Team.prototype.fromJSON(t1);
-		var t2 = jsono.team2;
-		t2 = new Team.prototype.fromJSON(t2);
+  var vote = $("input[type='radio']:checked").val();
+  vote  = vote.toLowerCase() == "yes" ? true : false;
 
-		return new Event(jsono.id, jsono.start, t1, t2, jsono.loc, jsono.score);
-	}
-	console.log(jsono);
-	throw "Bad json";
+  if (blockedGames.pluckIds().length == 0) {
+    alert("Need to chose 1 or more events to vote for.");
+    return;
+  }
+
+  $("#game-list li input:checked").parent();
+
+  var data = {
+    gameIds: blockedGames.pluckIds().toString(),
+    content: pageContent,
+    url: pageUrl,
+    vote: vote
+  };
+  $.post(url, data, function (response) {
+    console.log("Posted vote to server, got response:", response);
+    response = $.parseJSON(response);
+
+    if (!response.status || !MessageStatuses.fromStr(response.status)) {
+      alert("Server did not return a recognized response message.");
+      return;
+    }
+
+    var status = MessageStatuses.fromStr(response.status);
+    var message = "";
+    if (response.message) message = response.message;
+
+    if (status == MessageStatuses.OK || status == MessageStatuses.WARNING) {
+      blockedGames.reset();
+      blockedGamesView.render();
+      gamesListView.render();
+    } 
+    console.log("message:", message);
+    messagesList.add(new Message({message: message, status: status}));
+  });
 }
-
-var Team = function (id, loc, name) {
-	if (!this instanceof Team) return new Team(id, loc, name);
-
-	this.id = id;
-	this.loc = loc;
-	this.name = name;
-
-	this.toString = function () {
-		return this.loc + " " + this.name;
-	}
-}
-
-Team.prototype.fromJSON = function (jsono) {
-	if (jsono.id && jsono.loc && jsono.name) {
-		return new Team(jsono.id, jsono.loc, jsono.name);
-	}
-	throw "Bad json";
-}
-

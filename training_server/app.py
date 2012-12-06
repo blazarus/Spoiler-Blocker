@@ -1,11 +1,19 @@
 from flask import *
 from contextlib import closing
-from model import *
-import json
-import sqlite3
+import json, sqlite3, shelve
 import pdb, traceback
-from datetime import datetime
+import numpy as np
+from datetime import datetime, timedelta
+from model import *
+from liveupdate import *
+from SVM import *
+
 DATABASE = "sb.sqlite"
+SHELVE = 'svm_shelf.txt'
+LIVEUPDATE_INTERVAL = timedelta(minutes=15)
+
+with closing(shelve.open(SHELVE, writeback=True)) as shelf:
+    shelf['liveupdate_interval'] = LIVEUPDATE_INTERVAL
 
 app = Flask(__name__)
 
@@ -33,6 +41,18 @@ def load_nba_teams():
     print "*********       Loading NBA teams      *********"
     print "************************************************"
     f = open('static/nbateams.txt','r')
+    load_teams(f)
+    print "Finished loading NBA teams"
+
+def load_nfl_teams():
+    print "************************************************"
+    print "*********       Loading NFL teams      *********"
+    print "************************************************"
+    f = open('static/nflteams.txt','r')
+    load_teams(f)
+    print "Finished loading NFL teams"
+
+def load_teams(f):
     with closing(connect_db()) as db:
         for line in f:
             loc,name = line.strip().split(',')
@@ -40,7 +60,7 @@ def load_nba_teams():
             db.execute("INSERT INTO teams (loc, name) VALUES (?,?);",(loc,name))
 
         db.commit()
-    print "Finished loading NBA teams"
+
 
 def sql_execute(*args):
     print "using my own db execute, args:", args
@@ -63,48 +83,49 @@ def display_add_event():
 
 @app.route('/events/add', methods=['POST'])
 def add_event():
-    try:
-        print request.form
-        print "Ok got a http post"
+    print request.form
+    print "Ok got a http post"
 
-        year, month, day = [int(x) for x in request.form['startdate'].split('-')]
-        time = request.form['starttime'].strip()
-        hour, minute = [int(x) for x in time.split(":")]
+    year, month, day = [int(x) for x in request.form['startdate'].split('-')]
+    time = request.form['starttime'].strip()
+    hour, minute = [int(x) for x in time.split(":")]
 
-        print hour, minute
-        print year, month, day
+    print hour, minute
+    print year, month, day
 
-        stime = str(datetime(year, month, day, hour, minute).toordinal()) #to get utc timestamp
+    stime = datetime(year, month, day, hour, minute)
 
-        event = Event(
-            -1,
-            stime, 
-            request.form['team1'], 
-            request.form['team2'], 
-            request.form['location']
-        )
+    team1 = Team.from_id(g.db, request.form['team1'])
+    team2 = Team.from_id(g.db, request.form['team2'])
 
+    event = Event(
+        -1,
+        stime, 
+        team1, 
+        team2, 
+        request.form['location']
+    )
+
+    if event.add_to_db(g.db):
         print "event:", event
-
-        sql_execute("INSERT INTO events (start, team1, team2, \
-                            location) VALUES (?,?,?,?);",\
-            (event.start, event.team1, event.team2, event.loc))
 
         # pdb.set_trace()
         msg =  "This event has been recorded."
         return render_template('addevt.html', message=msg, error=False)
-    except Exception as e:
-        print "Exception:", e
-        traceback.print_exc()
-        msg =  "There was a problem."
-        if type(e) == sqlite3.IntegrityError:
-            msg = "This event already exists."
+    else:
+        msg = "This event already exists."
         return render_template('addevt.html', message=msg, error=True)
 
 @app.route('/events/', methods=['GET'])
 def events():
     events = Event.get_all(g.db)
-    print events
+    print "Returning all events:", events
+    return json.dumps([event.toJSON() for event in events])
+
+@app.route('/nflgames/', methods=['GET'])
+def events():
+    events = NFL_Game.get_all(g.db)
+    print "Returning all nfl games:", events
     return json.dumps([event.toJSON() for event in events])
 #     return render_template('addevt.html')
 
@@ -115,29 +136,93 @@ def get_all_teams():
 
 @app.route('/vote', methods=['POST'])
 def vote():
-    # print "Vote form", request.form
-    url = request.form['url']
-    content = request.form['content']
+    try:
+        url = request.form['url']
+        content = request.form['content']
+        eventIds = [int(x) for x in request.form['gameIds'].split(',')]
 
-    vote = True if 'vote' in request.form else False
+        vote = True if request.form['vote'].lower() == "true" else False
 
-    eventid = request.form['event']
+        print "vote:", vote
+        print "event ids:", eventIds
 
-    doc = Document(None, url, content)
-    if doc.add_to_db(g.db):
-        print "Added document to DB"
-        print "doc id:", doc.id
-    else:
-        print "Document already exists in DB"
-        doc = Document.get_from_db(g.db, url, content)
+        doc = Document(None, url, content)
+        if doc.add_to_db(g.db):
+            print "Added document to DB"
+            print "doc id:", doc.id
+        else:
+            print "Document already exists in DB"
+            doc = Document.get_from_db(g.db, url, content)
 
-    # Record vote
-    g.db.execute("INSERT INTO votes (vote, document, event) VALUES (?,?,?);", (vote, doc.id, eventid))
-    g.db.commit()
+        repeats = []
 
-    return "ok"
+        for eventid in eventIds:
+            # Record vote - if vote has already been cast, check whether it was autogenerated
+            # If the vote was autogenerated and this vote differs, overwrite that vote
+            try:
+                g.db.execute("INSERT INTO votes (vote, document, event) VALUES (?,?,?);", (vote, doc.id, eventid))
+                print "Successfully cast vote for event with id:", eventid
+            except Exception, e:
+                curs = g.db.execute("SELECT * FROM votes WHERE document=? AND event=?;", (doc.id, eventid))
+                row = curs.fetchone()
+                if not row:
+                    print "Something went wrong, this shouldn't happen."
+                    return
+                id, v, d, e, t, autogenerated = row
+                if autogenerated and vote != v:
+                    # overwrite the existing vote
+                    print "Overwriting an exisitng autogenerated vote"
+                    g.db.execute("UPDATE votes SET vote=?, autogenerated=? \
+                        WHERE event=? AND document=?", (vote, False, eventid, doc.id))
+                else:
+                    repeats.append( eventid )
+                    print "There has already been a vote cast (not autogenerated) for this event", eventid, "and doc", doc.id
+        g.db.commit()
+        if len(repeats) == 0:
+            return json.dumps({"status": "ok", "message": "Vote was recorded successfully."})
+        else:
+            repeats = [NFL_Game.from_id(g.db, id) for id in repeats]
+            if len(repeats) == 1:
+                msg = "There was already a vote for:<br />" + str(repeats[0])
+            else:
+                msg = "There were already votes for:<br />" + str('<br />'.join([str(r) for r in repeats]))
+            print "Returning message:", msg
+            return json.dumps({"status": "warning", "message": msg})
+    except Exception as e:
+        traceback.print_exc()
+        print "There was an error trying to record the vote. Returning error. Exception:", e
+        return json.dumps({"status": "error", "message": "There was an error trying to record the vote."})
 
-def doit():
+def fill_negative_votes():
+    """
+    Assume that all positive votes for a document have been made by a user,
+    so it will be negative for the rest of the events. We can autogenerate these votes.
+    """
+    with closing(connect_db()) as db:
+        events = Event.get_all(db)
+        docs = Document.get_all(db)
+
+        for doc in docs:
+            curs = db.execute("SELECT * FROM votes WHERE document = ?", (doc.id,))
+            votes = curs.fetchall()
+
+            seen = []
+            for id, vote, doc_id, evt_id, time, autogen in votes:
+                seen.append(evt_id)
+
+            for evt in events:
+                if evt.id not in seen:
+                    # Cast a vote for a negative vote
+                    db.execute("INSERT INTO votes (vote, document, event, autogenerated) \
+                        VALUES (?,?,?,?);", (False, doc.id, evt.id, True))
+                    print "Autogenerated negative vote for event", evt.id, "and document", doc.id
+
+        db.commit()
+
+def get_all_votes():
+    """
+    Returns a list of all votes in form (vote (boolean), Event, Document)
+    """
     with closing(connect_db()) as db:
         # Get votes with enough info to make event and doc objects
         curs = db.execute("SELECT vote, events.id, start, location, score, teams1.id, teams1.loc, \
@@ -151,70 +236,295 @@ def doit():
                 teams2_id, teams2_loc, teams2_name, doc_id, url, content in curs.fetchall():
             team1 = Team(teams1_id, teams1_loc, teams1_name)
             team2 = Team(teams2_id, teams2_loc, teams2_name)
+            start = datetime.fromordinal(start)
             event = Event(evt_id, start, team1, team2, loc)
             doc = Document(doc_id, url, content)
 
             votes.append( (vote, event, doc) )
 
-        words={} # maps doc.id to a list of words it contains
-        all_words = []
+        return votes
+
+def get_doc_words(votes):
+    words={} # maps doc.id to a list of words it contains
+    all_words = []
+    for vote, event, doc in votes:
+        docwords = doc.get_words()
+        words[doc.id] = {} # word -> count of that word in the doc
+        for word in docwords:
+            if not words[doc.id].get(word):
+                words[doc.id][word] = 1
+            else:
+                words[doc.id][word] += 1
+
+        # Keep track of all words seen
+        for word in words[doc.id].keys():
+            if word not in all_words:
+                all_words.append(word)
+
+    return all_words, words
+
+
+def get_feature_vecs(db, shelf):
+    votes = get_all_votes()
+
+    events = Event.get_all(db)
+    teams = Team.get_all(db)
+    all_locations = []
+    for evt in events:
+        if evt.loc not in all_locations:
+            all_locations.append(evt.loc)
+
+    all_words, words = get_doc_words(votes)
+
+    # cache these in the shelve
+    shelf['all_locs'] = all_locations
+    shelf['all_teams'] = teams
+    shelf['events'] = events
+    shelf['all_words'] = all_words
+
+    # Make feature vectors
+    X = None
+    Y = None
+    for vote, event, doc in votes:
+        # Tricky way to get vote to be -1 or 1 (from a boolean)
+        vote = math.pow(-1, int(vote)+1)
+        vec = make_featurevec(doc, event, teams, all_locations, all_words, words[doc.id])
+        print vec, vote
+
+        if X == None:
+            X = vec
+            Y = np.array([vote], dtype='float64')
+        else:
+            X = np.vstack((X, vec))
+            Y = np.concatenate((Y, np.array([vote])))
+
+    print"\n\n"
+    print "Training data:"
+    print "X:", X
+    print "Y:", Y
+    
+    return X, Y
+
+def make_featurevec(doc, event, all_teams, all_locs, all_words, doc_word_counts):
+    # Event portion of the feature vec
+    evtvec = [0]*(len(all_teams)+len(all_locs))
+    for i in range(len(all_teams)):
+        team = all_teams[i]
+        if event.team1.id == team.id or event.team2.id == team.id:
+            evtvec[i] = 1
+    for i in range(len(all_locs)):
+        loc = all_locs[i]
+        if loc.lower() == event.loc.lower():
+            evtvec[len(all_teams)+i] = 1
+
+    # start time features
+    evtvec.append(int(datetime.now() > event.start))
+
+    onehour = timedelta(hours=1)
+    evtvec.append(int(datetime.now() > event.start + onehour))
+
+    twohours = timedelta(hours=2)
+    evtvec.append(int(datetime.now() > event.start + twohours))
+
+    if event.score != None:
+        evtvec.append(event.score.team1_score)
+        evtvec.append(event.score.team2_score)
+
+    # First add word counts
+    vec = [0]*(len(all_words)+7)
+    for i in range(len(all_words)):
+        word = all_words[i]
+        if doc_word_counts.get(word.lower()):
+            vec[i] = doc_word_counts[word.lower()]
+
+    # features of the document specific to the event
+    if doc_word_counts.get(event.team1.name.lower()):
+        vec[len(all_words)] = 1
+
+    if doc_word_counts.get(event.team2.name.lower()):
+        vec[len(all_words)+1] = 1
+
+    if doc_word_counts.get(event.team1.loc.lower()):
+        vec[len(all_words)+2] = 1
+
+    if doc_word_counts.get(event.team2.loc.lower()):
+        vec[len(all_words)+3] = 1
+
+    if doc_word_counts.get(event.loc.lower()):
+        vec[len(all_words)+4] = 1
+
+    if event.score != None:
+        t1_score = event.score.team1_score
+        t2_score = event.score.team2_score
+        if doc_word_counts.get(t1_score):
+            vec[len(all_words)+5] = 1
+        if doc_word_counts.get(t2_score):
+            vec[len(all_words)+6] = 1
+
+    # Append the event vector
+    vec += evtvec
+
+    # Make numpy array
+    vec = np.array(vec, dtype='float64')
+
+    return vec
+
+
+def train_svm():
+    with closing(connect_db()) as db:
+        with closing(shelve.open(SHELVE, writeback=True)) as shelf:
+            shelf['svm'] = SVM(C=1)
+            fill_negative_votes()
+            X, Y = get_feature_vecs(db, shelf)
+
+            print "X:", X
+            print "Y:", Y
+
+            shelf['svm'].train_dual(X, Y)
+
+            for i in range(len(X)):
+                print i
+                print "actual:", Y[i]
+                print "predicted:", shelf['svm'].predict(X[i])
+
+            print "Num incorrect:", shelf['svm'].num_incorrect(X, Y)
+
+def test():
+    with closing(connect_db()) as db:
+        svm = SVM(C=1)
+        fill_negative_votes()
+        X, Y = get_feature_vecs(db)
+
+        # Divide up X into S chunks
+        N = len(X)
+        S = N
+
+        # Cross validation, and get the averate number of misclassified
+        count = 0
+        total_incorrect = 0
+        for s in range(S):
+            print "iter:", count
+            size_of_fold = math.ceil(1.0*N/S)
+            start = s*size_of_fold
+            end = start + size_of_fold
+            if end > N:
+                print "end > N"
+                end = N
+            print "range:", start, end
+            holdoutX = X[start:end,:]
+            trainingX = np.concatenate( (X[0:start], X[end:N]) )
+
+            holdoutY = Y[start:end]
+            trainingY = np.concatenate( (Y[0:start], Y[end:N]) )
+
+            print "len holdoutX:", len(holdoutX)
+            print "len trainingX;", len(trainingX)
+            print "len holdoutY:", len(holdoutY)
+            print "len trainingY;", len(trainingY)
+
+            svm.train_dual(trainingX, trainingY)
+
+            num_misclass = svm.num_incorrect(holdoutX, holdoutY)
+            total_incorrect += num_misclass
+            print "Num incorrect:", num_misclass
+
+            count +=1
+        print "Total misclassified with SVM:", 1.0 * total_incorrect
+
+        # Now use keyword classification
+        votes = get_all_votes()
+        num_incorrect = 0
         for vote, event, doc in votes:
-            docwords = doc.get_words()
-            words[doc.id] = {} # word -> count of that word in the doc
-            for word in docwords:
-                if not words[doc.id].get(word):
-                    words[doc.id][word] = 1
-                else:
-                    words[doc.id][word] += 1
+            classify = keyword_classify(event, doc)
+            if classify != vote:
+                print "Classified as:", classify, "actual:", vote
+                num_incorrect += 1
+            else:
+                print "Classified as:", classify, "actual:", vote
 
-            # Keep track of all words seen
-            for word in words[doc.id].keys():
-                if word not in all_words:
-                    all_words.append(word)
-
-        # Make feature vectors
-        training_data = {} # Maps event.id -> (feature vector, vote)
-        for vote, event, doc in votes:
-            # First add word counts
-            vec = [0]*(len(all_words)+6)
-            for i in range(len(all_words)):
-                word = all_words[i]
-                if words[doc.id].get(word):
-                    vec[i] = words[doc.id][word]
-
-            # features specific to the event
-            if words[doc.id].get(event.team1.name):
-                vec[len(all_words)] = 1
-
-            if words[doc.id].get(event.team2.name):
-                vec[len(all_words)+1] = 1
-
-            if words[doc.id].get(event.team1.loc):
-                vec[len(all_words)+2] = 1
-
-            if words[doc.id].get(event.team2.loc):
-                vec[len(all_words)+3] = 1
-
-            if words[doc.id].get(event.loc):
-                vec[len(all_words)+4] = 1
-
-            if event.score != None and words[doc.id].get(str(event.score)):
-                vec[len(all_words)+5] = 1
-
-            training_data[event.id] = (vec, vote)
-            pdb.set_trace()
-
-        print"\n\n"
-        print "Got here"
-        print training_data
-        pdb.set_trace()
+        print "Total misclassified with keyword approach:", num_incorrect
 
 
 
+def keyword_classify(event, doc):
+    if datetime.now() < event.start:
+        # No reason to block any page before the event has started
+        return False
+
+    blacklist = ["Win","Lose"]
+
+    blacklist.append(event.team1.name)
+    blacklist.append(event.team1.loc)
+    blacklist.append(event.team2.name)
+    blacklist.append(event.team2.loc)
+    blacklist.append(event.loc)
+
+    if event.score != None:
+        t1_score = event.score.team1_score
+        t2_score = event.score.team2_score
+        blacklist.append(t1_score)
+        blacklist.append(t2_score)
+
+    docwords = doc.get_words()
+
+    for word in blacklist:
+        if word.lower() in docwords:
+            return True
+
+    return False
 
 
+@app.route("/classify", methods=['POST'])
+def classify():
+    if request.form.get('blockedGames') == None or request.form.get('blockedGames') == "":
+        print "No blocked games, just return False"
+        return json.dumps({"status":"ok", "prediction":False})
 
+    with closing(shelve.open(SHELVE, writeback=True)) as shelf:
+        print "request:", request.form.keys()
+        url = request.form['url']
+        content = request.form['content']
+        blocked_evts = [int(x) for x in request.form['blockedGames'].split(',')]
+        print "Blocked events:", blocked_evts
 
+        doc = Document(None, url, content)
+        for evtid in blocked_evts:
+            evt = NFL_Game.from_id(g.db, evtid)
+            pred = classify_doc(doc, evt, shelf)
+            if pred:
+                return json.dumps({"status":"ok", "prediction":True})
+
+        return json.dumps({"status":"ok", "prediction":False})
+
+def classify_doc(doc, event, shelf):
+    """
+    event -> Event object
+    doc -> Document object to be classified
+    """
+    print "Last live update:", shelf.get('last_liveupdate')
+    print "Live update interval:", shelf['liveupdate_interval']
+    if shelf.get('last_liveupdate') == None or datetime.now() > shelf['last_liveupdate'] + shelf['liveupdate_interval']:
+        get_nfl_info(g.db)
+        shelf['last_liveupdate'] = datetime.now()
+    if shelf.get('svm') == None:
+        train_svm()
+
+    docwords = doc.get_words()
+    doc_word_counts = {} # word -> count of that word in the doc
+    for word in docwords:
+        if not doc_word_counts.get(word):
+            doc_word_counts[word] = 1
+        else:
+            doc_word_counts[word] += 1
+
+    vec = make_featurevec(doc, event, shelf['all_teams'], shelf['all_locs'], shelf['all_words'], doc_word_counts)
+
+    pred = shelf.get('svm').predict(vec)
+    print "\nPredicting", pred
+
+    if pred < 0: return False
+    else: return True
 
 if __name__ == '__main__':
     app.run(debug=True)
+
